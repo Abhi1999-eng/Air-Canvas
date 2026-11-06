@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Air Canvas</title>
+<style>
+  :root { --bg:#0e0d0b; --ink:#f4f0e7; --muted:rgba(244,240,231,.6); --gold:#d9a521; --line:rgba(244,240,231,.16); }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  [hidden] { display:none !important; }
+  html,body { height:100%; background:var(--bg); color:var(--ink); font:14px/1.4 system-ui,-apple-system,sans-serif; overflow:hidden; }
+  #stage { position:fixed; inset:0; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; }
+  video { object-fit:cover; transform:scaleX(-1); opacity:.35; filter:grayscale(.4); }
+  #ink, #hud { pointer-events:none; }
+  #bar { position:fixed; top:16px; left:50%; transform:translateX(-50%); display:flex; gap:8px; align-items:center;
+         padding:8px; background:rgba(14,13,11,.8); border:1px solid var(--line); border-radius:14px; backdrop-filter:blur(6px); z-index:5; flex-wrap:wrap; max-width:calc(100vw - 32px); justify-content:center; }
+  .btn { min-width:44px; height:44px; padding:0 12px; border-radius:10px; border:1px solid var(--line); background:transparent; color:var(--ink); cursor:pointer; font:inherit; }
+  .btn.on { border-color:var(--gold); box-shadow:inset 0 0 0 1px var(--gold); }
+  .btn.hot { background:rgba(217,165,33,.25); }
+  .sw { width:44px; padding:0; }
+  .sw i { display:block; width:22px; height:22px; border-radius:50%; margin:auto; }
+  #status { position:fixed; left:16px; bottom:16px; font:12px ui-monospace,monospace; color:var(--muted); z-index:5; }
+  #status b { color:var(--ink); }
+  #gate { position:fixed; inset:0; display:grid; place-items:center; z-index:10; background:var(--bg); text-align:center; padding:16px; }
+  #gate h1 { font-size:34px; font-weight:600; letter-spacing:-.02em; }
+  #gate p { color:var(--muted); max-width:44ch; margin:12px auto 24px; }
+  #gate .btn { height:48px; padding:0 22px; border-color:var(--gold); }
+  label.sl { display:flex; align-items:center; gap:6px; color:var(--muted); font-size:12px; padding:0 6px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="cam" playsinline muted></video>
+  <canvas id="ink"></canvas>
+  <canvas id="hud"></canvas>
+</div>
+
+<div id="bar" hidden>
+  <button class="btn sw on" data-color="#f4f0e7" title="White"><i style="background:#f4f0e7"></i></button>
+  <button class="btn sw" data-color="#d9a521" title="Gold"><i style="background:#d9a521"></i></button>
+  <button class="btn sw" data-color="#4fb3ff" title="Blue"><i style="background:#4fb3ff"></i></button>
+  <button class="btn sw" data-color="#ff5d5d" title="Red"><i style="background:#ff5d5d"></i></button>
+  <button class="btn" data-act="eraser" title="Eraser (E)">Eraser</button>
+  <button class="btn" data-act="undo" title="Undo (Ctrl/Cmd+Z)">Undo</button>
+  <button class="btn" data-act="clear" title="Clear (C)">Clear</button>
+  <button class="btn" data-act="save" title="Save PNG (S)">Save</button>
+  <label class="sl">Steady <input id="steady" type="range" min="0" max="100" value="70"></label>
+</div>
+
+<div id="status"></div>
+
+<div id="gate">
+  <div>
+    <h1>Air Canvas</h1>
+    <p>Pinch your thumb and index finger to draw in the air. Open them to lift the pen. Hover the toolbar and pinch to pick a tool. Everything runs in this browser; the camera never leaves your device.</p>
+    <button class="btn" id="start">Turn on camera</button>
+    <p id="err" style="color:#ff8a8a"></p>
+  </div>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = (s) => document.querySelector(s);
+const video = $("#cam"), ink = $("#ink"), hud = $("#hud");
+const ictx = ink.getContext("2d"), hctx = hud.getContext("2d");
+const statusEl = $("#status");
+
+// ---------- One Euro filter: smooth when slow, responsive when fast ----------
+class LowPass { constructor(){ this.y=null; } f(x,a){ this.y = this.y===null ? x : a*x+(1-a)*this.y; return this.y; } }
+class OneEuro {
+  constructor(minCutoff=1.0, beta=0.007, dCutoff=1.0){ Object.assign(this,{minCutoff,beta,dCutoff}); this.x=new LowPass(); this.dx=new LowPass(); this.t=null; }
+  alpha(cut, dt){ const r = 2*Math.PI*cut*dt; return r/(r+1); }
+  filter(v, t){
+    if (this.t===null){ this.t=t; this.dx.y=0; return this.x.f(v,1); }
+    const dt = Math.max(1e-3,(t-this.t)/1000); this.t=t;
+    const prev = this.x.y, d = (v-prev)/dt;
+    const ed = this.dx.f(d, this.alpha(this.dCutoff, dt));
+    return this.x.f(v, this.alpha(this.minCutoff + this.beta*Math.abs(ed), dt));
+  }
+  reset(){ this.x=new LowPass(); this.dx=new LowPass(); this.t=null; }
+}
+let fx, fy, lazyR = 8;
+function makeFilters(){
+  // "Steady" 0..100. Two layers of steadiness:
+  // 1) One Euro on the raw point. beta is tiny because positions are in
+  //    pixels: speeds run to hundreds of px/s, and 0.01 switched smoothing off.
+  // 2) A lazy brush: the pen only moves when the cursor pulls it further than
+  //    a radius, so tremor inside that radius never reaches the ink.
+  const s = +$("#steady").value/100;
+  const minCutoff = 2.0 - s*1.7;        // 2.0 .. 0.3 Hz
+  const beta = 0.002 - s*0.0015;        // 0.002 .. 0.0005
+  fx = new OneEuro(minCutoff, beta); fy = new OneEuro(minCutoff, beta);
+  lazyR = 2 + s*16;                     // 2 .. 18 px
+}
+$("#steady").addEventListener("input", makeFilters);
+
+// ---------- Canvas sizing ----------
+let W=0, H=0, DPR=1;
+function resize(){
+  DPR = Math.min(2, window.devicePixelRatio||1); W = innerWidth; H = innerHeight;
+  for (const c of [ink,hud]){ c.width=W*DPR; c.height=H*DPR; }
+  ictx.setTransform(DPR,0,0,DPR,0,0); hctx.setTransform(DPR,0,0,DPR,0,0);
+  redraw();
+}
+addEventListener("resize", resize);
+
+// Map a normalized landmark to screen pixels, matching object-fit:cover + mirror.
+function toScreen(nx, ny){
+  const vw = video.videoWidth||1280, vh = video.videoHeight||720;
+  const s = Math.max(W/vw, H/vh), ox = (vw*s - W)/2, oy = (vh*s - H)/2;
+  return [ (1-nx)*vw*s - ox, ny*vh*s - oy ];
+}
+
+// ---------- Strokes ----------
+const strokes = []; let cur = null;
+let color = "#f4f0e7", eraser = false;
+function widthFor(speed){ return Math.max(2.2, 7 - speed*0.004); } // faster → thinner, like a pen
+function drawSeg(st, i){
+  const p = st.pts; if (i<2) return;
+  const a=p[i-2], b=p[i-1], c=p[i];
+  const m1=[(a[0]+b[0])/2,(a[1]+b[1])/2], m2=[(b[0]+c[0])/2,(b[1]+c[1])/2];
+  ictx.globalCompositeOperation = st.eraser ? "destination-out" : "source-over";
+  ictx.strokeStyle = st.color; ictx.lineCap="round"; ictx.lineJoin="round";
+  ictx.lineWidth = st.eraser ? 36 : c[2];
+  ictx.beginPath(); ictx.moveTo(m1[0],m1[1]); ictx.quadraticCurveTo(b[0],b[1],m2[0],m2[1]); ictx.stroke();
+}
+function redraw(){
+  ictx.clearRect(0,0,W,H);
+  for (const st of strokes) for (let i=2;i<st.pts.length;i++) drawSeg(st,i);
+  ictx.globalCompositeOperation="source-over";
+}
+
+// ---------- Toolbar: works by mouse and by pinch ----------
+function setColor(btn){ document.querySelectorAll(".sw").forEach(b=>b.classList.remove("on")); btn.classList.add("on"); color=btn.dataset.color; eraser=false; $('[data-act=eraser]').classList.remove("on"); }
+function act(name){
+  if (name==="eraser"){ eraser=!eraser; $('[data-act=eraser]').classList.toggle("on", eraser); }
+  if (name==="undo"){ strokes.pop(); redraw(); }
+  if (name==="clear"){ strokes.length=0; redraw(); }
+  if (name==="save"){
+    const out=document.createElement("canvas"); out.width=ink.width; out.height=ink.height;
+    const o=out.getContext("2d"); o.fillStyle="#0e0d0b"; o.fillRect(0,0,out.width,out.height); o.drawImage(ink,0,0);
+    const a=document.createElement("a"); a.download="air-canvas.png"; a.href=out.toDataURL("image/png"); a.click();
+  }
+}
+function press(btn){ if (btn.dataset.color) setColor(btn); else act(btn.dataset.act); }
+document.querySelectorAll("#bar .btn").forEach(b=>b.addEventListener("click",()=>press(b)));
+addEventListener("keydown",(e)=>{
+  if ((e.metaKey||e.ctrlKey) && e.key==="z"){ e.preventDefault(); act("undo"); }
+  else if (e.key==="e") act("eraser"); else if (e.key==="c") act("clear"); else if (e.key==="s") act("save");
+});
+function buttonAt(x,y){
+  for (const b of document.querySelectorAll("#bar .btn")){ const r=b.getBoundingClientRect(); if (x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom) return b; }
+  return null;
+}
+
+// ---------- Hand tracking ----------
+let landmarker, lastVideoTime=-1, penDown=false, lastPt=null, hovered=null, pressedBtn=null;
+let fps=0, frames=0, fpsT=performance.now();
+// Pinch in real-world metres (MediaPipe worldLandmarks), so it doesn't change
+// with distance from the camera or with the hand turning. Hysteresis plus a
+// few frames of agreement before the pen changes state.
+const PINCH_DOWN=0.022, PINCH_UP=0.038, FRAMES_DOWN=3, FRAMES_UP=2;
+let downVotes=0, upVotes=0;
+let pen=null;            // lazy-brush position
+const tail=[];           // last few points, dropped when the pen lifts (fingers opening drag the point)
+
+async function start(){
+  $("#start").disabled=true; $("#err").textContent="";
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:60}, facingMode:"user" }, audio:false });
+    video.srcObject=stream; await video.play();
+    const files = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    const opts = (delegate)=>({ baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate },
+      runningMode:"VIDEO", numHands:1, minHandDetectionConfidence:0.6, minHandPresenceConfidence:0.6, minTrackingConfidence:0.6 });
+    try { landmarker = await HandLandmarker.createFromOptions(files, opts("GPU")); }
+    catch { landmarker = await HandLandmarker.createFromOptions(files, opts("CPU")); }
+    $("#gate").hidden=true; $("#bar").hidden=false; makeFilters(); resize(); loop();
+  } catch (e) {
+    $("#start").disabled=false;
+    $("#err").textContent = e.name==="NotAllowedError" ? "Camera permission was declined. Allow it in the address bar and try again." : "Couldn't start: "+e.message;
+  }
+}
+$("#start").addEventListener("click", start);
+
+function loop(){
+  const now = performance.now();
+  if (video.currentTime !== lastVideoTime){
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, now);
+    frame(res.landmarks?.[0], res.worldLandmarks?.[0], now);
+    frames++; if (now-fpsT>1000){ fps=frames; frames=0; fpsT=now; }
+  }
+  requestAnimationFrame(loop);
+}
+
+function frame(lm, wl, t){
+  hctx.clearRect(0,0,W,H);
+  if (!lm || !wl){ penDown=false; downVotes=upVotes=0; endStroke(); fx.reset(); fy.reset(); pen=null; setHover(null); status(false,0); return; }
+
+  // Pinch: 3D distance between thumb tip and index tip, in metres.
+  const pinch = Math.hypot(wl[4].x-wl[8].x, wl[4].y-wl[8].y, wl[4].z-wl[8].z);
+  if (!penDown){ downVotes = pinch < PINCH_DOWN ? downVotes+1 : 0; if (downVotes>=FRAMES_DOWN){ penDown=true; upVotes=0; } }
+  else         { upVotes   = pinch > PINCH_UP   ? upVotes+1   : 0; if (upVotes>=FRAMES_UP){ penDown=false; downVotes=0; } }
+
+  // The pen tip is the midpoint of thumb and index: it barely moves as you pinch.
+  const P = (i)=>toScreen(lm[i].x, lm[i].y);
+  const [tx,ty]=P(4), [ix,iy]=P(8);
+  const rx = fx.filter((tx+ix)/2, t), ry = fy.filter((ty+iy)/2, t);
+
+  // Lazy brush: the pen trails the cursor on a string of length lazyR.
+  if (!pen) pen=[rx,ry];
+  const dx=rx-pen[0], dy=ry-pen[1], d=Math.hypot(dx,dy);
+  if (d>lazyR){ pen[0]+=dx*(1-lazyR/d); pen[1]+=dy*(1-lazyR/d); }
+  const x=pen[0], y=pen[1];
+
+  // Toolbar: pinch while over a button presses it once.
+  const btn = buttonAt(x,y); setHover(btn);
+  if (btn){ endStroke(); if (penDown && pressedBtn!==btn){ press(btn); pressedBtn=btn; } if (!penDown) pressedBtn=null; }
+  else {
+    pressedBtn=null;
+    if (penDown){
+      const speed = lastPt ? Math.hypot(x-lastPt[0], y-lastPt[1]) / Math.max(1,(t-lastPt[2])) * 1000 : 0;
+      if (!cur){ cur={ color, eraser, pts:[] }; strokes.push(cur); }
+      const prev = cur.pts.at(-1);
+      // Skip sub-pixel jitter; smooth the width so it doesn't flicker.
+      if (!prev || Math.hypot(x-prev[0],y-prev[1]) > 1.2){
+        const w = prev ? prev[2]*0.7 + widthFor(speed)*0.3 : widthFor(0);
+        cur.pts.push([x,y,w]); drawSeg(cur, cur.pts.length-1);
+      }
+    } else endStroke();
+  }
+  lastPt=[x,y,t];
+
+  // Cursor: faint dot where the hand is, ring where the pen is, a line between (the lazy-brush string).
+  hctx.fillStyle="rgba(244,240,231,.35)"; hctx.beginPath(); hctx.arc(rx,ry,3,0,Math.PI*2); hctx.fill();
+  hctx.strokeStyle="rgba(244,240,231,.25)"; hctx.lineWidth=1; hctx.beginPath(); hctx.moveTo(rx,ry); hctx.lineTo(x,y); hctx.stroke();
+  hctx.lineWidth=2; hctx.strokeStyle = eraser ? "#ff8a8a" : color;
+  hctx.beginPath(); hctx.arc(x,y, eraser?18:10, 0, Math.PI*2); hctx.stroke();
+  if (penDown && !btn){ hctx.fillStyle=hctx.strokeStyle; hctx.beginPath(); hctx.arc(x,y,4,0,Math.PI*2); hctx.fill(); }
+  // Pinch meter: fills as fingers close; gold once the pen is down.
+  const fill = Math.max(0, Math.min(1, (PINCH_UP - pinch)/(PINCH_UP - 0.008)));
+  hctx.fillStyle = penDown ? "#d9a521" : "rgba(244,240,231,.5)"; hctx.fillRect(x+16, y+10-20*fill, 4, 20*fill);
+  status(true, pinch);
+}
+function endStroke(){
+  if (!cur) return;
+  // Opening the fingers drags the midpoint for a frame or two: drop that hook.
+  const drop = Math.min(3, Math.max(0, cur.pts.length-3));
+  if (drop) { cur.pts.splice(-drop, drop); redraw(); }
+  if (cur.pts.length<3) { strokes.pop(); redraw(); }
+  cur=null;
+}
+function setHover(b){ if (hovered===b) return; hovered?.classList.remove("hot"); hovered=b; b?.classList.add("hot"); }
+function status(seen, pinch){
+  statusEl.innerHTML = seen
+    ? `hand <b>yes</b> · pen <b>${penDown?"down":"up"}</b> · pinch ${(pinch*100).toFixed(1)} cm (down &lt; ${PINCH_DOWN*100}, up &gt; ${PINCH_UP*100}) · ${fps} fps`
+    : `show one hand to the camera · ${fps} fps`;
+}
+</script>
+</body>
+</html>
